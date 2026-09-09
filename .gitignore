@@ -1,0 +1,12 @@
+node_modules
+.next
+.vercel
+.env
+.env.local
+.env.production
+npm-debug.log*
+.env
+.env.local
+.env.*.local
+node_modules
+.next
