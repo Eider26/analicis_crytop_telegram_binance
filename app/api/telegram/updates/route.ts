@@ -1,6 +1,5 @@
-
 import { NextRequest } from "next/server";
-import { openTrade } from "../../../../lib/trades";
+import { openTrade, getOpenTrade } from "../../../../lib/trades";
 
 const TELEGRAM_BASE = "https://api.telegram.org";
 
@@ -8,35 +7,19 @@ export async function POST(req: NextRequest) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
 
   if (!token) {
-    return Response.json(
-      {
-        ok: false,
-        error: "Falta TELEGRAM_BOT_TOKEN en .env.local",
-      },
-      { status: 500 }
-    );
+    console.error("Falta TELEGRAM_BOT_TOKEN");
+
+    // Importante:
+    // Respondemos 200 para evitar reintentos infinitos de Telegram.
+    return Response.json({
+      ok: true,
+      processed: false,
+      error: "Falta TELEGRAM_BOT_TOKEN",
+    });
   }
 
   try {
     const body = await req.json();
-
-    /*
-     * ============================================
-     * TELEGRAM WEBHOOK
-     * ============================================
-     *
-     * Telegram enviará algo parecido a:
-     *
-     * {
-     *   "update_id": 123456,
-     *   "message": {
-     *      "chat": {
-     *          "id": 123456789
-     *      },
-     *      "text": "COMPRÉ 101.08"
-     *   }
-     * }
-     */
 
     const message =
       body.message ??
@@ -46,6 +29,7 @@ export async function POST(req: NextRequest) {
     if (!message?.chat) {
       return Response.json({
         ok: true,
+        processed: true,
         message: "Update recibido sin mensaje.",
       });
     }
@@ -57,14 +41,15 @@ export async function POST(req: NextRequest) {
         ? message.text.trim()
         : "";
 
-    console.log("Telegram mensaje:", {
+    console.log("Telegram mensaje recibido:", {
+      updateId: body.update_id,
       chatId,
       text,
     });
 
     /*
      * ============================================
-     * COMANDO /start
+     * /start
      * ============================================
      */
 
@@ -77,9 +62,10 @@ export async function POST(req: NextRequest) {
           "",
           "✅ Bot conectado correctamente.",
           "",
-          "Para registrar una compra escribe:",
+          "Comandos disponibles:",
           "",
           "COMPRÉ 101.08",
+          "VENDÍ 103.50",
           "",
           "Ejemplo:",
           "COMPRÉ 103.50",
@@ -88,7 +74,8 @@ export async function POST(req: NextRequest) {
 
       return Response.json({
         ok: true,
-        message: "Comando /start procesado.",
+        processed: true,
+        message: "/start procesado.",
       });
     }
 
@@ -96,13 +83,6 @@ export async function POST(req: NextRequest) {
      * ============================================
      * COMANDO COMPRÉ
      * ============================================
-     *
-     * Acepta:
-     *
-     * COMPRÉ 101.08
-     * COMPRE 101.08
-     * compre 101.08
-     * compré 101,08
      */
 
     const buyMatch = text.match(
@@ -125,59 +105,136 @@ export async function POST(req: NextRequest) {
         );
 
         return Response.json({
-          ok: false,
+          ok: true,
+          processed: true,
           error: "Precio inválido.",
         });
       }
 
       /*
-       * ============================================
+       * ========================================
+       * VERIFICAR OPERACIÓN ABIERTA
+       * ========================================
+       */
+
+      try {
+        const existingTrade = await getOpenTrade();
+
+        if (existingTrade) {
+          await sendTelegramMessage(
+            token,
+            chatId,
+            [
+              "⚠️ YA EXISTE UNA OPERACIÓN ABIERTA",
+              "",
+              "🪙 SOLUSDT",
+              "",
+              `💵 Entrada: ${Number(
+                existingTrade.entry_price
+              ).toFixed(4)} USDT`,
+              `📦 Cantidad: ${
+                existingTrade.quantity
+                  ? Number(
+                      existingTrade.quantity
+                    ).toFixed(6)
+                  : "No registrada"
+              } SOL`,
+              "",
+              `🛑 Stop Loss: ${Number(
+                existingTrade.stop_loss
+              ).toFixed(4)} USDT`,
+              `🎯 Take Profit: ${Number(
+                existingTrade.take_profit
+              ).toFixed(4)} USDT`,
+              "",
+              "❌ No se abrió otra operación.",
+              "",
+              "Primero cierra la operación actual.",
+            ].join("\n")
+          );
+
+          // IMPORTANTE:
+          // Respondemos 200, no 409.
+          // Así Telegram no vuelve a enviar el mismo update.
+          return Response.json({
+            ok: true,
+            processed: true,
+            operationOpened: false,
+            reason: "OPEN_TRADE_EXISTS",
+            tradeId: existingTrade.id,
+          });
+        }
+      } catch (error) {
+        console.error(
+          "Error consultando operación abierta:",
+          error
+        );
+
+        await sendTelegramMessage(
+          token,
+          chatId,
+          [
+            "❌ ERROR CONSULTANDO OPERACIÓN",
+            "",
+            error instanceof Error
+              ? error.message
+              : "Error desconocido.",
+          ].join("\n")
+        );
+
+        return Response.json({
+          ok: true,
+          processed: true,
+          operationOpened: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Error desconocido.",
+        });
+      }
+
+      /*
+       * ========================================
        * CAPITAL
-       * ============================================
-       *
-       * Usaremos 8 USDT por operación.
+       * ========================================
        */
 
       const capitalUSDT = 8;
 
       /*
-       * ============================================
-       * CANTIDAD DE SOL
-       * ============================================
+       * ========================================
+       * CANTIDAD SOL
+       * ========================================
        */
 
       const quantity =
         capitalUSDT / entryPrice;
 
       /*
-       * ============================================
-       * STOP LOSS
-       * ============================================
-       *
-       * -1.2%
+       * ========================================
+       * STOP LOSS -1.2%
+       * ========================================
        */
 
       const stopLoss =
         entryPrice * 0.988;
 
       /*
-       * ============================================
-       * TAKE PROFIT
-       * ============================================
-       *
-       * +2%
+       * ========================================
+       * TAKE PROFIT +2%
+       * ========================================
        */
 
       const takeProfit =
         entryPrice * 1.02;
 
-      try {
-        /*
-         * ========================================
-         * GUARDAR EN SUPABASE
-         * ========================================
-         */
+      /*
+       * ========================================
+       * CREAR OPERACIÓN
+       * ========================================
+       */
 
+      try {
         const trade = await openTrade({
           entryPrice,
           quantity,
@@ -187,15 +244,9 @@ export async function POST(req: NextRequest) {
         });
 
         console.log(
-          "Operación guardada:",
+          "Operación guardada correctamente:",
           trade
         );
-
-        /*
-         * ========================================
-         * RESPUESTA AL MISMO CHAT
-         * ========================================
-         */
 
         const responseText = [
           "🟢 OPERACIÓN ABIERTA",
@@ -224,8 +275,8 @@ export async function POST(req: NextRequest) {
 
         return Response.json({
           ok: true,
-          message:
-            "Operación abierta y guardada.",
+          processed: true,
+          operationOpened: true,
           trade,
         });
       } catch (error) {
@@ -249,13 +300,20 @@ export async function POST(req: NextRequest) {
           ].join("\n")
         );
 
-        return Response.json(
-          {
-            ok: false,
-            error: errorMessage,
-          },
-          { status: 409 }
-        );
+        /*
+         * MUY IMPORTANTE:
+         *
+         * No devolvemos 409.
+         * Devolvemos 200 para evitar que Telegram
+         * reintente indefinidamente el mismo mensaje.
+         */
+
+        return Response.json({
+          ok: true,
+          processed: true,
+          operationOpened: false,
+          error: errorMessage,
+        });
       }
     }
 
@@ -273,7 +331,7 @@ export async function POST(req: NextRequest) {
         "",
         "⚠️ No reconocí esa acción.",
         "",
-        "Para registrar una compra utiliza:",
+        "Para registrar una compra:",
         "",
         "COMPRÉ 101.08",
       ].join("\n")
@@ -281,6 +339,7 @@ export async function POST(req: NextRequest) {
 
     return Response.json({
       ok: true,
+      processed: true,
       message: "Mensaje recibido pero no reconocido.",
     });
   } catch (error) {
@@ -289,16 +348,19 @@ export async function POST(req: NextRequest) {
       error
     );
 
-    return Response.json(
-      {
-        ok: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Error desconocido.",
-      },
-      { status: 500 }
-    );
+    /*
+     * Respondemos 200 para evitar reintentos
+     * infinitos de Telegram.
+     */
+
+    return Response.json({
+      ok: true,
+      processed: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Error desconocido.",
+    });
   }
 }
 
@@ -317,16 +379,13 @@ async function sendTelegramMessage(
     `${TELEGRAM_BASE}/bot${token}/sendMessage`,
     {
       method: "POST",
-
       headers: {
         "Content-Type": "application/json",
       },
-
       body: JSON.stringify({
         chat_id: chatId,
         text,
       }),
-
       cache: "no-store",
     }
   );
